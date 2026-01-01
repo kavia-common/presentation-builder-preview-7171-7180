@@ -172,21 +172,49 @@ function zipStore(files) {
 }
 
 /**
+ * Read a File object as an ArrayBuffer.
+ */
+async function readFileAsArrayBuffer(file) {
+  if (!file) throw new Error('No file provided');
+  return await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Failed to read file'));
+    reader.onload = () => resolve(reader.result);
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+/**
+ * Convert a uint8 buffer to base64 (for embedding in PPTX).
+ */
+function u8ToBase64(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+/**
  * Creates minimal PPTX XML parts.
  * Note: This is a lightweight, standards-based PPTX generator (no Node APIs).
- * It supports titles + body text and a simple 2-column approximation.
+ * It supports:
+ * - A locked cover slide (slide1) with background image + name/date overlay
+ * - Titles + body text and a simple 2-column approximation for subsequent slides
  */
-function buildPptxBytes({ slides, title }) {
+function buildPptxBytes({ slides, title, cover }) {
   const slideCount = slides.length;
 
   const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="png" ContentType="image/png"/>
   <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
   <Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
   <Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>
   <Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>
+  <Override PartName="/ppt/media/cover.png" ContentType="image/png"/>
   <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
   ${Array.from({ length: slideCount - 1 }, (_, i) => {
     const n = i + 2;
@@ -302,11 +330,145 @@ function buildPptxBytes({ slides, title }) {
   </p:cSld>
 </p:sldLayout>`;
 
-  // Slide relationships: relate to slideLayout1
+  // Slide relationships:
+  // - cover slide also relates to cover.png
+  const coverSlideRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/cover.png"/>
+</Relationships>`;
+
+  // Subsequent slides: relate to slideLayout1
   const slideRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
 </Relationships>`;
+
+  const slideXmlCover = (s0) => {
+    const coverTitle = escapeXml(safeText(s0.title).trim() || safeText(title).trim() || 'Cover');
+    const nameText = escapeXml(safeText(cover?.name).trim() || '');
+    const dateText = escapeXml(safeText(cover?.date).trim() || '');
+
+    // Full slide image
+    const slideW = 13.333 * 914400;
+    const slideH = 7.5 * 914400;
+
+    // Overlay texts (approx position matching the provided image)
+    const titleX = 0.8 * 914400;
+    const titleY = 2.1 * 914400;
+    const titleW = 6.4 * 914400;
+    const titleH = 0.8 * 914400;
+
+    const metaX = 0.8 * 914400;
+    const nameY = 2.95 * 914400;
+    const dateY = 3.45 * 914400;
+    const metaW = 6.2 * 914400;
+    const metaH = 0.45 * 914400;
+
+    const mkTextBox = ({ id, name, x, y, w, h, text, bold, size, colorHex }) => `      <p:sp>
+        <p:nvSpPr>
+          <p:cNvPr id="${id}" name="${name}"/>
+          <p:cNvSpPr txBox="1"/>
+          <p:nvPr/>
+        </p:nvSpPr>
+        <p:spPr>
+          <a:xfrm>
+            <a:off x="${x}" y="${y}"/>
+            <a:ext cx="${w}" cy="${h}"/>
+          </a:xfrm>
+        </p:spPr>
+        <p:txBody>
+          <a:bodyPr wrap="square"/>
+          <a:lstStyle/>
+          <a:p>
+            <a:r>
+              <a:rPr lang="en-US" b="${bold ? 1 : 0}" sz="${size}">
+                <a:solidFill><a:srgbClr val="${colorHex}"/></a:solidFill>
+                <a:latin typeface="Aptos Display"/>
+              </a:rPr>
+              <a:t>${text}</a:t>
+            </a:r>
+          </a:p>
+        </p:txBody>
+      </p:sp>`;
+
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+  xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr>
+        <p:cNvPr id="1" name=""/>
+        <p:cNvGrpSpPr/>
+        <p:nvPr/>
+      </p:nvGrpSpPr>
+      <p:grpSpPr/>
+
+      <!-- Background image -->
+      <p:pic>
+        <p:nvPicPr>
+          <p:cNvPr id="2" name="Cover Image"/>
+          <p:cNvPicPr/>
+          <p:nvPr/>
+        </p:nvPicPr>
+        <p:blipFill>
+          <a:blip r:embed="rId2"/>
+          <a:stretch><a:fillRect/></a:stretch>
+        </p:blipFill>
+        <p:spPr>
+          <a:xfrm>
+            <a:off x="0" y="0"/>
+            <a:ext cx="${slideW}" cy="${slideH}"/>
+          </a:xfrm>
+          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+        </p:spPr>
+      </p:pic>
+
+${mkTextBox({
+  id: 10,
+  name: 'Cover Title',
+  x: titleX,
+  y: titleY,
+  w: titleW,
+  h: titleH,
+  text: coverTitle,
+  bold: true,
+  size: 3200,
+  colorHex: 'FFFFFF',
+})}
+
+${mkTextBox({
+  id: 11,
+  name: 'Cover Name',
+  x: metaX,
+  y: nameY,
+  w: metaW,
+  h: metaH,
+  text: nameText ? `Name : ${nameText}` : 'Name :',
+  bold: true,
+  size: 1800,
+  colorHex: 'FFFFFF',
+})}
+
+${mkTextBox({
+  id: 12,
+  name: 'Cover Date',
+  x: metaX,
+  y: dateY,
+  w: metaW,
+  h: metaH,
+  text: dateText ? `Date : ${dateText}` : 'Date :',
+  bold: true,
+  size: 1800,
+  colorHex: 'FFFFFF',
+})}
+
+    </p:spTree>
+  </p:cSld>
+  <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>
+</p:sld>`;
+  };
 
   // Simple slide XML with 2 text boxes (title + body).
   const slideXmlFor = (slide, idx) => {
@@ -327,8 +489,7 @@ function buildPptxBytes({ slides, title }) {
             .join('')
         : `<a:p><a:r><a:rPr lang="en-US" dirty="0"/><a:t></a:t></a:r></a:p>`;
 
-    // Position in EMUs (1 inch = 914400). Slide size is 13.333" x 7.5".
-    // Title at (0.7, 0.6), body at (0.9, 1.7). We keep it simple.
+    // Position in EMUs (1 inch = 914400). Slide size is 13.333" x 7.5". We keep it simple.
     const titleX = 0.7 * 914400;
     const titleY = 0.6 * 914400;
     const titleW = 11.9 * 914400;
@@ -504,6 +665,9 @@ function buildPptxBytes({ slides, title }) {
 </p:sld>`;
   };
 
+  const coverPngBytes =
+    cover?.imageBytes instanceof Uint8Array ? cover.imageBytes : new Uint8Array(cover?.imageBytes || []);
+
   const files = [
     { name: '[Content_Types].xml', data: utf8Bytes(contentTypes) },
     { name: '_rels/.rels', data: utf8Bytes(rootRels) },
@@ -514,11 +678,17 @@ function buildPptxBytes({ slides, title }) {
     { name: 'ppt/slideMasters/_rels/slideMaster1.xml.rels', data: utf8Bytes(slideMasterRels) },
     { name: 'ppt/slideLayouts/slideLayout1.xml', data: utf8Bytes(slideLayoutXml) },
     { name: 'ppt/slideLayouts/_rels/slideLayout1.xml.rels', data: utf8Bytes(slideLayoutRels) },
-    ...slides.flatMap((s, i) => [
-      { name: `ppt/slides/slide${i + 1}.xml`, data: utf8Bytes(slideXmlFor(s, i)) },
-      { name: `ppt/slides/_rels/slide${i + 1}.xml.rels`, data: utf8Bytes(slideRels) },
-    ]),
-    // docProps are optional; omit for minimal package.
+    { name: 'ppt/media/cover.png', data: coverPngBytes },
+    // Slides
+    { name: 'ppt/slides/slide1.xml', data: utf8Bytes(slideXmlCover(slides[0])) },
+    { name: 'ppt/slides/_rels/slide1.xml.rels', data: utf8Bytes(coverSlideRels) },
+    ...slides.slice(1).flatMap((s, i) => {
+      const slideNumber = i + 2; // because slide1 is cover
+      return [
+        { name: `ppt/slides/slide${slideNumber}.xml`, data: utf8Bytes(slideXmlFor(s, slideNumber - 1)) },
+        { name: `ppt/slides/_rels/slide${slideNumber}.xml.rels`, data: utf8Bytes(slideRels) },
+      ];
+    }),
   ];
 
   return zipStore(files);
@@ -570,7 +740,51 @@ function SlideThumbnail({ slide, index, isSelected, onSelect }) {
   );
 }
 
-function SlidePreview({ slide }) {
+function CoverSlidePreview({ slide, cover }) {
+  const title = safeText(slide.title).trim() || 'Cover';
+  const name = safeText(cover?.name).trim();
+  const date = safeText(cover?.date).trim();
+  const imgSrc = cover?.imagePreviewUrl || '/assets/cover-slide.png';
+
+  return (
+    <div className="preview">
+      <div className="preview__paper preview__paper--cover">
+        <div
+          className="preview__coverBg"
+          aria-hidden="true"
+          style={{ backgroundImage: `url("${imgSrc}")` }}
+        />
+        <div className="preview__coverShade" aria-hidden="true" />
+        <div className="preview__coverOverlay">
+          <div className="preview__coverBadgeRow">
+            <span className="preview__coverBadge">Locked global cover • Slide 1</span>
+          </div>
+
+          <div className="preview__coverTitle">{title}</div>
+
+          <div className="preview__coverMeta" role="group" aria-label="Cover fields">
+            <div className="preview__coverMetaLine">
+              <span className="preview__coverMetaKey">Name :</span>
+              <span className="preview__coverMetaVal">{name || '—'}</span>
+            </div>
+            <div className="preview__coverMetaLine">
+              <span className="preview__coverMetaKey">Date :</span>
+              <span className="preview__coverMetaVal">{date || '—'}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="preview__note">Cover slide is locked and always remains first.</div>
+    </div>
+  );
+}
+
+function SlidePreview({ slide, cover }) {
+  // Cover slide is special and locked (index 0)
+  if (slide.isCover) {
+    return <CoverSlidePreview slide={slide} cover={cover} />;
+  }
+
   const title = safeText(slide.title).trim() || 'Untitled Slide';
   const body = safeText(slide.body).trim();
 
@@ -622,12 +836,44 @@ function App() {
   const [theme, setTheme] = useState('light');
 
   const [presentationTitle, setPresentationTitle] = useState('Ocean Professional Deck');
+
+  // Cover state (locked global slide 1)
+  const [coverName, setCoverName] = useState('Subrata B');
+  const [coverDate, setCoverDate] = useState('24 Dec 2023');
+  const [coverImageBytes, setCoverImageBytes] = useState(null);
+  const [coverImagePreviewUrl, setCoverImagePreviewUrl] = useState(null);
+
+  // Create the initial cover bytes from the public asset, so PPTX always includes the image.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadDefaultCoverBytes() {
+      try {
+        const res = await fetch('/assets/cover-slide.png', { cache: 'no-cache' });
+        const buf = await res.arrayBuffer();
+        if (cancelled) return;
+        setCoverImageBytes(new Uint8Array(buf));
+      } catch (e) {
+        // If it fails, PPTX will still generate; cover will just have no image bytes.
+        // Keep silent to avoid disrupting UX.
+      }
+    }
+
+    loadDefaultCoverBytes();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const [slides, setSlides] = useState(() => [
     {
-      id: createId(),
-      title: 'Quarterly Business Review',
-      body: 'Ocean Professional theme\nClient-side PPTX generation\nEdit slides and download instantly',
+      id: 'cover', // stable id
+      title: 'Weekly Metrics',
+      body: '',
       layout: 'title',
+      isCover: true,
+      locked: true,
     },
     {
       id: createId(),
@@ -679,6 +925,11 @@ function App() {
     setSlides(prev =>
       prev.map(s => {
         if (s.id !== slideId) return s;
+        // Cover slide is locked in position, but title can be edited (to render on cover)
+        if (s.isCover) {
+          const allowed = { title: patch.title };
+          return { ...s, ...allowed };
+        }
         return { ...s, ...patch };
       })
     );
@@ -702,6 +953,10 @@ function App() {
   function duplicateSlide(slideId) {
     const src = slides.find(s => s.id === slideId);
     if (!src) return;
+    if (src.isCover) {
+      setStatus({ type: 'error', message: 'Cover slide is locked and cannot be duplicated.' });
+      return;
+    }
 
     const clone = { ...src, id: createId(), title: src.title ? `${src.title} (Copy)` : '' };
     const idx = slides.findIndex(s => s.id === slideId);
@@ -717,8 +972,15 @@ function App() {
   }
 
   function removeSlide(slideId) {
-    if (slides.length <= 1) {
-      setStatus({ type: 'error', message: 'You must keep at least one slide.' });
+    const src = slides.find(s => s.id === slideId);
+    if (src?.isCover) {
+      setStatus({ type: 'error', message: 'Cover slide is locked and cannot be deleted.' });
+      return;
+    }
+
+    if (slides.length <= 2) {
+      // with a required cover, we still need at least 1 additional slide
+      setStatus({ type: 'error', message: 'You must keep at least one slide after the cover.' });
       return;
     }
 
@@ -737,6 +999,11 @@ function App() {
     const idx = slides.findIndex(s => s.id === slideId);
     if (idx < 0) return;
 
+    const src = slides[idx];
+    if (src?.isCover) return; // locked
+    // Also prevent moving another slide above cover
+    if (direction === 'up' && idx === 1) return;
+
     const target = direction === 'up' ? idx - 1 : idx + 1;
     if (target < 0 || target >= slides.length) return;
 
@@ -754,19 +1021,63 @@ function App() {
     if (!presentationTitle.trim()) {
       return 'Presentation title is required.';
     }
-    if (!slides.length) {
-      return 'Add at least one slide.';
+    if (slides.length < 2) {
+      return 'Add at least one slide after the cover.';
     }
+    // Cover name/date can be empty (optional), but encourage user by not erroring.
+
     for (let i = 0; i < slides.length; i += 1) {
       const s = slides[i];
       if (!safeText(s.title).trim()) {
         return `Slide ${i + 1} title is required.`;
       }
-      if (safeText(s.layout) !== 'title' && !safeText(s.body).trim()) {
+      if (!s.isCover && safeText(s.layout) !== 'title' && !safeText(s.body).trim()) {
         return `Slide ${i + 1} body text is required for this layout.`;
       }
     }
     return null;
+  }
+
+  async function handleCoverImageReplace(file) {
+    try {
+      if (!file) return;
+      if (!/image\/png/i.test(file.type) && !/image\/(jpeg|jpg)/i.test(file.type)) {
+        setStatus({ type: 'error', message: 'Please choose a PNG or JPG image.' });
+        return;
+      }
+
+      const buf = await readFileAsArrayBuffer(file);
+      const bytes = new Uint8Array(buf);
+
+      // PPTX part expects PNG. If JPG is provided we still embed as cover.png; Office may reject.
+      // For now, we accept PNG primarily; JPG is allowed for preview but may not render in PPT.
+      // To keep behavior predictable, hard-reject non-PNG for PPTX embedding.
+      if (!/image\/png/i.test(file.type)) {
+        setStatus({
+          type: 'error',
+          message: 'Only PNG is supported for PPTX embedding right now. Please provide a PNG image.',
+        });
+        return;
+      }
+
+      // Update state for both preview and PPTX generation.
+      setCoverImageBytes(bytes);
+
+      // Create a local preview URL
+      const blobUrl = URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
+      // Revoke old url to avoid leaks
+      setCoverImagePreviewUrl(prev => {
+        if (prev) URL.revokeObjectURL(prev);
+        return blobUrl;
+      });
+
+      setStatus({ type: 'success', message: 'Cover image replaced for this session.' });
+    } catch (e) {
+      setStatus({
+        type: 'error',
+        message: `Failed to replace cover image. ${e?.message ? `(${e.message})` : ''}`.trim(),
+      });
+    }
   }
 
   async function handleGenerateAndDownload() {
@@ -782,7 +1093,15 @@ function App() {
       setIsGenerating(true);
       setStatus({ type: 'working', message: 'Generating PPTX…' });
 
-      const bytes = buildPptxBytes({ slides, title: presentationTitle });
+      const bytes = buildPptxBytes({
+        slides,
+        title: presentationTitle,
+        cover: {
+          name: coverName,
+          date: coverDate,
+          imageBytes: coverImageBytes || new Uint8Array(),
+        },
+      });
 
       const fileNameBase = (presentationTitle || 'presentation')
         .trim()
@@ -803,6 +1122,17 @@ function App() {
       setIsGenerating(false);
     }
   }
+
+  const cover = useMemo(
+    () => ({
+      name: coverName,
+      date: coverDate,
+      imageBytes: coverImageBytes,
+      imagePreviewUrl: coverImagePreviewUrl,
+      imageDefaultAssetPath: '/assets/cover-slide.png',
+    }),
+    [coverName, coverDate, coverImageBytes, coverImagePreviewUrl]
+  );
 
   return (
     <div className="appShell">
@@ -877,6 +1207,8 @@ function App() {
                 <div className="slideList__items" role="list">
                   {slides.map((s, idx) => {
                     const isSelected = s.id === selectedSlideId;
+                    const isLockedCover = Boolean(s.isCover);
+
                     return (
                       <div key={s.id} className={`slideRow ${isSelected ? 'slideRow--selected' : ''}`} role="listitem">
                         <button
@@ -889,9 +1221,10 @@ function App() {
                           <span className="slideRow__text">
                             <span className="slideRow__title">
                               {safeText(s.title).trim() ? safeText(s.title).trim() : 'Untitled'}
+                              {isLockedCover ? ' (Locked Cover)' : ''}
                             </span>
                             <span className="slideRow__meta">
-                              {LAYOUTS.find(l => l.value === s.layout)?.label || 'Layout'}
+                              {isLockedCover ? 'Global cover (image + name/date)' : LAYOUTS.find(l => l.value === s.layout)?.label || 'Layout'}
                             </span>
                           </span>
                         </button>
@@ -901,9 +1234,9 @@ function App() {
                             type="button"
                             className="iconBtn"
                             onClick={() => moveSlide(s.id, 'up')}
-                            disabled={idx === 0}
+                            disabled={isLockedCover || idx <= 1}
                             aria-label="Move slide up"
-                            title="Move up"
+                            title={isLockedCover ? 'Cover is locked' : idx <= 1 ? 'Cannot move above cover' : 'Move up'}
                           >
                             ↑
                           </button>
@@ -911,9 +1244,9 @@ function App() {
                             type="button"
                             className="iconBtn"
                             onClick={() => moveSlide(s.id, 'down')}
-                            disabled={idx === slides.length - 1}
+                            disabled={isLockedCover || idx === slides.length - 1}
                             aria-label="Move slide down"
-                            title="Move down"
+                            title={isLockedCover ? 'Cover is locked' : 'Move down'}
                           >
                             ↓
                           </button>
@@ -921,8 +1254,9 @@ function App() {
                             type="button"
                             className="iconBtn"
                             onClick={() => duplicateSlide(s.id)}
+                            disabled={isLockedCover}
                             aria-label="Duplicate slide"
-                            title="Duplicate"
+                            title={isLockedCover ? 'Cover is locked' : 'Duplicate'}
                           >
                             ⧉
                           </button>
@@ -930,8 +1264,9 @@ function App() {
                             type="button"
                             className="iconBtn iconBtn--danger"
                             onClick={() => removeSlide(s.id)}
+                            disabled={isLockedCover}
                             aria-label="Delete slide"
-                            title="Delete"
+                            title={isLockedCover ? 'Cover is locked' : 'Delete'}
                           >
                             ✕
                           </button>
@@ -954,66 +1289,146 @@ function App() {
 
                 {selectedSlide ? (
                   <div className="slideEditor__form">
-                    <div className="field">
-                      <label className="field__label" htmlFor="slideTitle">
-                        Slide title <span className="field__req">*</span>
-                      </label>
-                      <input
-                        id="slideTitle"
-                        ref={titleInputRef}
-                        className="input"
-                        value={selectedSlide.title}
-                        onChange={e => setSlideField(selectedSlide.id, { title: e.target.value })}
-                        placeholder="e.g., Agenda"
-                      />
-                      {!safeText(selectedSlide.title).trim() ? (
-                        <div className="field__help field__help--error">Title is required.</div>
-                      ) : (
-                        <div className="field__help">Used as the main slide heading.</div>
-                      )}
-                    </div>
+                    {selectedSlide.isCover ? (
+                      <>
+                        <div className="notice notice--info" role="status" style={{ marginTop: 0 }}>
+                          <div className="notice__title">Cover slide</div>
+                          <div className="notice__message">
+                            Slide 1 is a locked global cover. You can edit Name/Date and the cover title, and you can
+                            replace the background image (position remains locked).
+                          </div>
+                        </div>
 
-                    <div className="field">
-                      <label className="field__label" htmlFor="slideLayout">
-                        Layout
-                      </label>
-                      <select
-                        id="slideLayout"
-                        className="select"
-                        value={selectedSlide.layout}
-                        onChange={e => setSlideField(selectedSlide.id, { layout: e.target.value })}
-                      >
-                        {LAYOUTS.map(l => (
-                          <option key={l.value} value={l.value}>
-                            {l.label}
-                          </option>
-                        ))}
-                      </select>
-                      <div className="field__help">A simple layout choice affects PPTX formatting.</div>
-                    </div>
+                        <div className="divider" />
 
-                    <div className="field">
-                      <label className="field__label" htmlFor="slideBody">
-                        Body text {selectedSlide.layout === 'title' ? '(optional)' : <span className="field__req">*</span>}
-                      </label>
-                      <textarea
-                        id="slideBody"
-                        className="textarea"
-                        value={selectedSlide.body}
-                        onChange={e => setSlideField(selectedSlide.id, { body: e.target.value })}
-                        placeholder={
-                          selectedSlide.layout === 'twoColumn'
-                            ? 'Use new lines to create bullet points.\nWe will auto-split between columns.'
-                            : 'Use new lines for bullet points.'
-                        }
-                        rows={selectedSlide.layout === 'title' ? 4 : 8}
-                      />
-                      {selectedSlide.layout !== 'title' && !safeText(selectedSlide.body).trim() ? (
-                        <div className="field__help field__help--error">Body text is required for this layout.</div>
-                      ) : (
-                        <div className="field__help">Tip: use new lines to create bullet-like rows.</div>
-                      )}
-                    </div>
+                        <div className="field">
+                          <label className="field__label" htmlFor="coverTitle">
+                            Cover title <span className="field__req">*</span>
+                          </label>
+                          <input
+                            id="coverTitle"
+                            ref={titleInputRef}
+                            className="input"
+                            value={selectedSlide.title}
+                            onChange={e => setSlideField(selectedSlide.id, { title: e.target.value })}
+                            placeholder="e.g., Weekly Metrics"
+                          />
+                          {!safeText(selectedSlide.title).trim() ? (
+                            <div className="field__help field__help--error">Title is required.</div>
+                          ) : (
+                            <div className="field__help">Shown on the cover overlay and embedded in the PPTX.</div>
+                          )}
+                        </div>
+
+                        <div className="field">
+                          <label className="field__label" htmlFor="coverName">
+                            Name (editable)
+                          </label>
+                          <input
+                            id="coverName"
+                            className="input"
+                            value={coverName}
+                            onChange={e => setCoverName(e.target.value)}
+                            placeholder="e.g., Jane Doe"
+                          />
+                          <div className="field__help">Renders on top of the cover image.</div>
+                        </div>
+
+                        <div className="field">
+                          <label className="field__label" htmlFor="coverDate">
+                            Date (editable)
+                          </label>
+                          <input
+                            id="coverDate"
+                            className="input"
+                            value={coverDate}
+                            onChange={e => setCoverDate(e.target.value)}
+                            placeholder="e.g., 01 Jan 2026"
+                          />
+                          <div className="field__help">Renders on top of the cover image.</div>
+                        </div>
+
+                        <div className="field">
+                          <label className="field__label" htmlFor="coverImage">
+                            Cover image (background)
+                          </label>
+                          <input
+                            id="coverImage"
+                            className="input"
+                            type="file"
+                            accept="image/png"
+                            onChange={e => handleCoverImageReplace(e.target.files?.[0] || null)}
+                          />
+                          <div className="field__help">
+                            Loaded from <code>{cover.imageDefaultAssetPath}</code> by default. You can replace it with a PNG
+                            (stored for this session). Position remains locked.
+                          </div>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="field">
+                          <label className="field__label" htmlFor="slideTitle">
+                            Slide title <span className="field__req">*</span>
+                          </label>
+                          <input
+                            id="slideTitle"
+                            ref={titleInputRef}
+                            className="input"
+                            value={selectedSlide.title}
+                            onChange={e => setSlideField(selectedSlide.id, { title: e.target.value })}
+                            placeholder="e.g., Agenda"
+                          />
+                          {!safeText(selectedSlide.title).trim() ? (
+                            <div className="field__help field__help--error">Title is required.</div>
+                          ) : (
+                            <div className="field__help">Used as the main slide heading.</div>
+                          )}
+                        </div>
+
+                        <div className="field">
+                          <label className="field__label" htmlFor="slideLayout">
+                            Layout
+                          </label>
+                          <select
+                            id="slideLayout"
+                            className="select"
+                            value={selectedSlide.layout}
+                            onChange={e => setSlideField(selectedSlide.id, { layout: e.target.value })}
+                          >
+                            {LAYOUTS.map(l => (
+                              <option key={l.value} value={l.value}>
+                                {l.label}
+                              </option>
+                            ))}
+                          </select>
+                          <div className="field__help">A simple layout choice affects PPTX formatting.</div>
+                        </div>
+
+                        <div className="field">
+                          <label className="field__label" htmlFor="slideBody">
+                            Body text {selectedSlide.layout === 'title' ? '(optional)' : <span className="field__req">*</span>}
+                          </label>
+                          <textarea
+                            id="slideBody"
+                            className="textarea"
+                            value={selectedSlide.body}
+                            onChange={e => setSlideField(selectedSlide.id, { body: e.target.value })}
+                            placeholder={
+                              selectedSlide.layout === 'twoColumn'
+                                ? 'Use new lines to create bullet points.\nWe will auto-split between columns.'
+                                : 'Use new lines for bullet points.'
+                            }
+                            rows={selectedSlide.layout === 'title' ? 4 : 8}
+                          />
+                          {selectedSlide.layout !== 'title' && !safeText(selectedSlide.body).trim() ? (
+                            <div className="field__help field__help--error">Body text is required for this layout.</div>
+                          ) : (
+                            <div className="field__help">Tip: use new lines to create bullet-like rows.</div>
+                          )}
+                        </div>
+                      </>
+                    )}
                   </div>
                 ) : (
                   <div className="emptyState">
@@ -1069,7 +1484,7 @@ function App() {
               ))}
             </div>
 
-            {selectedSlide ? <SlidePreview slide={selectedSlide} /> : null}
+            {selectedSlide ? <SlidePreview slide={selectedSlide} cover={cover} /> : null}
           </div>
         </section>
       </main>
